@@ -1,0 +1,608 @@
+###############################################################################
+## LOPIT Analysis: SVM for Joined TMT Data (Lojza's aggregated format)
+## Matches Lojza's filtering: filterRows=42, NAs imputed per-replicate, no row-norm
+## All 42 quanti columns used as a single dataset (3 reps x 14 fractions)
+## Fixes vs prior version:
+##   1. Multi-protein group rows kept as separate entries (Lojza-style, ~4910 rows)
+##   2. NAs imputed by per-replicate fraction-wise median (not replaced with 0)
+##   3. 3D t-SNE: interactive HTML output (Plotly)
+## Author: Abhishek Prakash Shinde
+###############################################################################
+
+# ---- Libraries ----
+library(tidyverse)
+library(readxl)
+library(MSnbase)
+library(pRoloc)
+library(pRolocdata)
+library(plotly)
+library(htmlwidgets)
+library(Rtsne)
+library(BiocParallel)
+library(scales)
+
+set.seed(42)
+
+# ---- Configuration ----
+data_file   <- "Bundle_joined_data_robustSummary_sumNorm_First_trial_repB_repC.xlsx"
+marker_file <- "markers_v6.xlsx"
+out_base    <- "LOPIT_results_joined"
+
+# Column layout of the joined data:
+#   Col 1 = ID (TVAG_XXXXXX, some multi-protein groups separated by "; ")
+#   Col 2 = header (description)
+#   Cols  3:16 = repF (14 fractions)
+#   Cols 17:30 = repB (14 fractions)
+#   Cols 31:44 = repC (14 fractions)
+all_quanti_cols <- 3:44
+id_col          <- 1
+desc_col        <- 2
+ids_sep         <- "; "
+
+# Filtering: match Lojza — only drop rows with >= filterRows NAs across ALL
+# 42 quanti columns. With filterRows=42 this effectively keeps everything.
+filterRows      <- 42
+
+# SVM: Lojza used fixed sigma/cost (no grid search), t_cutoff = 0.4
+svm_sigma           <- 0.1
+svm_cost            <- 16
+svm_t_cutoff        <- 0.4
+svm_per_compartment <- TRUE
+
+# t-SNE (3D)
+tsne_perplexity <- 30
+tsne_max_iter   <- 1000
+
+# Per-replicate column ranges (for individual replicate + overlap analysis)
+replicate_info <- list(
+  repF = list(abund_cols = 3:16),
+  repB = list(abund_cols = 17:30),
+  repC = list(abund_cols = 31:44)
+)
+
+dir.create(out_base, showWarnings = FALSE, recursive = TRUE)
+
+###############################################################################
+## HELPER FUNCTIONS
+###############################################################################
+
+#' Impute NAs using per-replicate fraction-wise median.
+impute_median <- function(abund, rep_blocks) {
+  for (cols in rep_blocks) {
+    block <- abund[, cols, drop = FALSE]
+    for (j in seq_len(ncol(block))) {
+      na_rows <- is.na(block[, j])
+      if (any(na_rows)) {
+        block[na_rows, j] <- median(block[, j], na.rm = TRUE)
+      }
+    }
+    abund[, cols] <- block
+  }
+  abund
+}
+
+
+#' Prepare data as MSnSet
+prepare_msnset <- function(raw_data, quanti_cols, markers_df, suffix,
+                           rep_blocks = NULL) {
+  
+  cat("  Preparing MSnSet:", suffix, "\n")
+  
+  ids   <- as.character(raw_data[[id_col]])
+  descs <- as.character(raw_data[[desc_col]])
+  abund <- as.data.frame(raw_data[, quanti_cols])
+  abund <- mutate_all(abund, as.double)
+  
+  if (is.null(rep_blocks)) {
+    rep_blocks <- list(all = seq_len(ncol(abund)))
+  }
+  n_na_before <- sum(is.na(abund))
+  abund <- impute_median(abund, rep_blocks)
+  n_na_after  <- sum(is.na(abund))
+  cat("    NAs before imputation:", n_na_before,
+      "| after:", n_na_after, "\n")
+  
+  all_na <- rowSums(is.na(abund)) == ncol(abund)
+  if (any(all_na)) {
+    ids   <- ids[!all_na]
+    descs <- descs[!all_na]
+    abund <- abund[!all_na, ]
+    cat("    Dropped", sum(all_na), "fully-NA rows after imputation.\n")
+  }
+  
+  na_counts <- rowSums(is.na(abund))
+  keep      <- na_counts < filterRows
+  ids   <- ids[keep]; descs <- descs[keep]; abund <- abund[keep, ]
+  cat("    Rows after NA filter (<", filterRows, "NAs):", sum(keep),
+      "/ removed:", sum(!keep), "\n")
+  
+  first_ids <- str_extract(ids, "TVAG_[A-Za-z0-9_]+")
+  
+  has_id <- !is.na(first_ids) & first_ids != ""
+  ids       <- ids[has_id]
+  first_ids <- first_ids[has_id]
+  descs     <- descs[has_id]
+  abund     <- abund[has_id, ]
+  
+  rownames_out <- first_ids
+  seen <- table(first_ids)
+  dup_ids <- names(seen[seen > 1])
+  for (did in dup_ids) {
+    positions <- which(first_ids == did)
+    for (k in seq_along(positions)[-1]) {
+      rownames_out[positions[k]] <- paste0(did, "_grp", k - 1)
+    }
+  }
+  
+  expr_mat           <- as.matrix(abund)
+  rownames(expr_mat) <- rownames_out
+  colnames(expr_mat) <- paste0("F", seq_len(ncol(expr_mat)))
+  
+  marker_assignments <- rep("unknown", length(rownames_out))
+  lead_ids <- str_extract(ids, "TVAG_[A-Za-z0-9_]+")
+  m <- match(lead_ids, markers_df$ID)
+  marker_assignments[!is.na(m)] <- markers_df$markers[m[!is.na(m)]]
+  
+  fdata <- data.frame(
+    Accession   = rownames_out,
+    FullID      = ids,
+    Description = descs,
+    markers     = marker_assignments,
+    stringsAsFactors = FALSE,
+    row.names   = rownames_out
+  )
+  
+  n_matched <- sum(marker_assignments != "unknown")
+  cat("    Proteins (rows):", nrow(expr_mat),
+      "| Markers matched:", n_matched, "\n")
+  
+  pdata <- data.frame(
+    sampleNames = colnames(expr_mat),
+    Fraction    = seq_len(ncol(expr_mat)),
+    row.names   = colnames(expr_mat)
+  )
+  
+  MSnSet(
+    exprs = expr_mat,
+    fData = new("AnnotatedDataFrame", data = fdata),
+    pData = new("AnnotatedDataFrame", data = pdata)
+  )
+}
+
+
+#' Run SVM with fixed sigma/cost (matching Lojza) + optimisation for comparison
+run_svm_analysis <- function(msnset, out_dir, suffix, use_fixed_params = FALSE) {
+  
+  cat("\n=== SVM:", suffix, "===\n")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  n_markers <- sum(fData(msnset)$markers != "unknown")
+  if (n_markers == 0) stop("No marker proteins found for '", suffix, "'.")
+  cat("  Marker proteins:", n_markers, "\n")
+  
+  marker_tbl <- table(getMarkers(msnset))
+  weights    <- 1 / marker_tbl[names(marker_tbl) != "unknown"]
+  
+  if (use_fixed_params) {
+    cat("  Using fixed SVM params: sigma =", svm_sigma, ", cost =", svm_cost, "\n")
+    params <- svmOptimisation(msnset, fcol = "markers", class.weights = weights,
+                              sigmas = svm_sigma, costs = svm_cost)
+  } else {
+    cat("  Optimising SVM hyperparameters...\n")
+    params <- svmOptimisation(msnset, fcol = "markers", class.weights = weights)
+  }
+  save(params, file = file.path(out_dir, paste0("svm_params_", suffix, ".Rdata")))
+  
+  png(file.path(out_dir, paste0("F1_optimisation_", suffix, ".png")),
+      width = 2000, height = 1500, res = 300)
+  plot(params); dev.off()
+  
+  png(file.path(out_dir, paste0("F1_levelplot_", suffix, ".png")),
+      width = 2000, height = 1500, res = 300)
+  print(levelPlot(params)); dev.off()
+  
+  cat("  Running SVM classification...\n")
+  svmres <- svmClassification(msnset, fcol = "markers", assessRes = params)
+  save(svmres, file = file.path(out_dir, paste0("SVMres_", suffix, ".Rdata")))
+  
+  if (svm_per_compartment) {
+    thresholds  <- orgQuants(svmres, fcol = "svm", scol = "svm.scores",
+                             mcol = "markers", t = svm_t_cutoff)
+    svmres_pred <- getPredictions(svmres, fcol = "svm", scol = "svm.scores",
+                                  mcol = "markers", t = thresholds)
+  } else {
+    svmres_pred <- getPredictions(svmres, fcol = "svm", t = svm_t_cutoff)
+  }
+  
+  p_box <- ggplot(fData(svmres), aes(x = svm, y = svm.scores)) +
+    geom_boxplot(fill = "lightblue") +
+    geom_hline(yintercept = svm_t_cutoff, color = "red", linetype = 2) +
+    coord_flip() + theme_minimal(base_size = 12) +
+    labs(x = "Compartment", y = "SVM Score",
+         title = paste0("SVM Scores - ", suffix))
+  ggsave(file.path(out_dir, paste0("SVM_scores_", suffix, ".png")),
+         p_box, width = 10, height = 6, dpi = 300)
+  
+  cat("  SVM complete.\n")
+  list(svmres = svmres, svmres_pred = svmres_pred, params = params)
+}
+
+
+#' Plot organellar marker profiles
+plot_marker_profiles <- function(msnset, out_dir, suffix) {
+  
+  fdat           <- fData(msnset)
+  expr           <- exprs(msnset)
+  marker_classes <- unique(fdat$markers[fdat$markers != "unknown"])
+  
+  if (length(marker_classes) == 0) {
+    cat("  No markers — skipping profile plots.\n"); return(invisible(NULL))
+  }
+  
+  marker_dir <- file.path(out_dir, "marker_profiles")
+  dir.create(marker_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  all_data <- lapply(marker_classes, function(mc) {
+    idx <- which(fdat$markers == mc)
+    as.data.frame(expr[idx, , drop = FALSE]) %>%
+      mutate(Accession = rownames(expr)[idx]) %>%
+      pivot_longer(-Accession, names_to = "Fraction", values_to = "Abundance") %>%
+      mutate(Fraction = factor(Fraction, levels = colnames(expr)), Compartment = mc)
+  })
+  
+  for (i in seq_along(marker_classes)) {
+    mc        <- marker_classes[i]
+    safe_name <- str_replace_all(mc, "[^A-Za-z0-9_]", "_")
+    p <- ggplot(all_data[[i]], aes(x = Fraction, y = Abundance, group = Accession)) +
+      geom_line(alpha = 0.4, color = "steelblue") +
+      geom_point(size = 1, alpha = 0.4, color = "steelblue") +
+      stat_summary(aes(group = 1), fun = mean, geom = "line",  color = "red", linewidth = 1.2) +
+      stat_summary(aes(group = 1), fun = mean, geom = "point", color = "red", size = 2) +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = paste0(mc, " - ", suffix), x = "Fraction", y = "Abundance")
+    ggsave(file.path(marker_dir, paste0(safe_name, "_", suffix, ".png")),
+           p, width = 8, height = 5, dpi = 300)
+  }
+  
+  summary_df <- bind_rows(all_data) %>%
+    group_by(Compartment, Fraction) %>%
+    summarise(mean_abund = mean(Abundance, na.rm = TRUE), .groups = "drop")
+  
+  p_all <- ggplot(summary_df, aes(x = Fraction, y = mean_abund,
+                                  color = Compartment, group = Compartment)) +
+    geom_line(linewidth = 1) + geom_point(size = 2) +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste0("All Marker Profiles - ", suffix),
+         x = "Fraction", y = "Mean Abundance", color = "Compartment")
+  ggsave(file.path(out_dir, paste0("all_marker_profiles_", suffix, ".png")),
+         p_all, width = 12, height = 7, dpi = 300)
+  
+  cat("  Marker profiles saved.\n")
+}
+
+
+#' t-SNE 3D + SVM prediction overlay -> interactive HTML + CSV
+#'
+#' Runs Rtsne with dims = 3 and produces a single self-contained Plotly HTML.
+#' Two trace layers are drawn:
+#'   Layer 1 — all proteins, coloured by SVM prediction, small semi-transparent markers
+#'   Layer 2 — known training markers on top, same colour palette, larger with black border
+generate_tsne_outputs <- function(msnset, out_dir, suffix) {
+  
+  cat("  Generating 3D t-SNE...\n")
+  expr_mat <- exprs(msnset)
+  fdat     <- fData(msnset)
+  
+  set.seed(42)
+  tsne_res <- Rtsne(expr_mat, dims = 3, perplexity = tsne_perplexity,
+                    max_iter = tsne_max_iter, pca = TRUE,
+                    check_duplicates = FALSE, verbose = FALSE)
+  coords <- tsne_res$Y   # n x 3 matrix
+  
+  pred_col  <- if ("svm.pred"   %in% colnames(fdat)) "svm.pred"   else "svm"
+  score_col <- if ("svm.scores" %in% colnames(fdat)) "svm.scores" else NULL
+  
+  plot_df <- tibble(
+    Accession   = rownames(expr_mat),
+    tSNE1       = coords[, 1],
+    tSNE2       = coords[, 2],
+    tSNE3       = coords[, 3],
+    Marker      = fdat$markers,
+    Prediction  = fdat[[pred_col]],
+    Score       = if (!is.null(score_col)) round(as.numeric(fdat[[score_col]]), 4) else NA_real_,
+    Description = if ("Description" %in% colnames(fdat)) fdat$Description else fdat$FullID
+  ) %>%
+    mutate(label = paste0(
+      "ID: ",          Accession,
+      "<br>Prediction: ", Prediction,
+      "<br>Score: ",      Score,
+      "<br>Marker: ",     Marker,
+      "<br>",             str_trunc(Description, 60)
+    ))
+  
+  compartments <- sort(unique(fdat$markers[fdat$markers != "unknown"]))
+  all_levels   <- c(compartments, "unknown")
+  colors       <- setNames(c(hue_pal()(length(compartments)), "grey70"), all_levels)
+  
+  plot_df$Prediction <- factor(plot_df$Prediction, levels = all_levels)
+  marker_df          <- filter(plot_df, Marker != "unknown")
+  
+  # ---- Interactive 3D HTML ----
+  # Build one trace per compartment for clean legend control
+  fig3d <- plot_ly()
+  
+  for (lvl in all_levels) {
+    sub <- filter(plot_df, as.character(Prediction) == lvl)
+    if (nrow(sub) == 0) next
+    
+    fig3d <- fig3d %>%
+      add_trace(
+        data       = sub,
+        type       = "scatter3d",
+        mode       = "markers",
+        x          = ~tSNE1,
+        y          = ~tSNE2,
+        z          = ~tSNE3,
+        name       = lvl,
+        text       = ~label,
+        hoverinfo  = "text",
+        marker     = list(
+          size    = 3,
+          color   = colors[lvl],
+          opacity = 0.55,
+          line    = list(width = 0)
+        ),
+        showlegend = TRUE,
+        legendgroup = lvl
+      )
+  }
+  
+  # Overlay known markers — larger, with black border, same colour as compartment
+  if (nrow(marker_df) > 0) {
+    for (mc in compartments) {
+      sub_m <- filter(marker_df, Marker == mc)
+      if (nrow(sub_m) == 0) next
+      
+      fig3d <- fig3d %>%
+        add_trace(
+          data        = sub_m,
+          type        = "scatter3d",
+          mode        = "markers",
+          x           = ~tSNE1,
+          y           = ~tSNE2,
+          z           = ~tSNE3,
+          name        = paste0(mc, " (marker)"),
+          text        = ~label,
+          hoverinfo   = "text",
+          marker      = list(
+            size    = 7,
+            color   = colors[mc],
+            opacity = 1.0,
+            line    = list(color = "black", width = 1.5)
+          ),
+          showlegend  = TRUE,
+          legendgroup = mc          # links toggle to the same legend group
+        )
+    }
+  }
+  
+  fig3d <- fig3d %>%
+    layout(
+      title = list(
+        text = paste0("<b>3D t-SNE — SVM Predictions: ", suffix, "</b>"),
+        font = list(size = 16)
+      ),
+      scene = list(
+        xaxis = list(title = "t-SNE 1", showgrid = TRUE,
+                     gridcolor = "rgba(200,200,200,0.5)", zeroline = FALSE),
+        yaxis = list(title = "t-SNE 2", showgrid = TRUE,
+                     gridcolor = "rgba(200,200,200,0.5)", zeroline = FALSE),
+        zaxis = list(title = "t-SNE 3", showgrid = TRUE,
+                     gridcolor = "rgba(200,200,200,0.5)", zeroline = FALSE),
+        bgcolor = "white"
+      ),
+      legend = list(
+        title      = list(text = "<b>Compartment</b>"),
+        itemsizing = "constant",
+        tracegroupgap = 2
+      ),
+      paper_bgcolor = "white",
+      margin = list(l = 0, r = 0, b = 0, t = 60)
+    )
+  
+  saveWidget(fig3d,
+             file          = file.path(normalizePath(out_dir),
+                                       paste0("tSNE3D_SVM_", suffix, ".html")),
+             selfcontained = FALSE)
+  
+  # ---- Predictions CSV ----
+  plot_df %>%
+    select(Accession, Description, Marker, Prediction, Score, tSNE1, tSNE2, tSNE3) %>%
+    write_csv(file.path(out_dir, paste0("predictions_SVM_", suffix, ".csv")))
+  
+  cat("  3D t-SNE interactive HTML saved. Predictions CSV exported.\n")
+}
+
+
+###############################################################################
+## MAIN PIPELINE
+###############################################################################
+
+# ---- Load markers ----
+cat("Loading markers...\n")
+markers_raw <- read_xlsx(marker_file, col_names = TRUE)
+markers_df  <- tibble(
+  ID      = trimws(as.character(markers_raw[[1]])),
+  markers = trimws(as.character(markers_raw[[2]]))
+) %>%
+  filter(!is.na(ID), !is.na(markers), ID != "NA", ID != "ID",
+         markers != "NA", markers != "markers") %>%
+  distinct(ID, .keep_all = TRUE)
+
+cat("Markers loaded:", nrow(markers_df), "proteins across",
+    n_distinct(markers_df$markers), "compartments\n")
+cat("Compartments:", paste(sort(unique(markers_df$markers)), collapse = ", "), "\n\n")
+
+
+# ---- Read the joined data once ----
+cat("Reading joined data:", data_file, "\n")
+raw_data <- read_xlsx(data_file)
+cat("  Raw dimensions:", nrow(raw_data), "x", ncol(raw_data), "\n\n")
+
+
+###############################################################################
+## PART 1: FULL JOINED ANALYSIS (Lojza's approach — all 42 cols as one)
+###############################################################################
+
+cat("\n", strrep("=", 70), "\n")
+cat("FULL JOINED ANALYSIS (all 42 quanti cols, Lojza's method)\n")
+cat(strrep("=", 70), "\n")
+
+joined_dir <- file.path(out_base, "Joined_all42")
+dir.create(joined_dir, showWarnings = FALSE, recursive = TRUE)
+
+joined_msnset <- prepare_msnset(raw_data, all_quanti_cols, markers_df, "Joined_all42",
+                                rep_blocks = list(repF = 1:14, repB = 15:28, repC = 29:42))
+plot_marker_profiles(joined_msnset, joined_dir, "Joined_all42")
+svm_joined <- run_svm_analysis(joined_msnset, joined_dir, "Joined_all42",
+                               use_fixed_params = TRUE)
+generate_tsne_outputs(svm_joined$svmres_pred, joined_dir, "Joined_all42")
+
+cat("JOINED ANALYSIS COMPLETE\n")
+
+
+###############################################################################
+## PART 2: PER-REPLICATE ANALYSIS (each 14-fraction set independently)
+###############################################################################
+
+replicate_results <- list()
+
+for (rep_name in names(replicate_info)) {
+  
+  cat("\n", strrep("=", 70), "\n")
+  cat("PROCESSING:", rep_name, "\n")
+  cat(strrep("=", 70), "\n")
+  
+  info    <- replicate_info[[rep_name]]
+  rep_dir <- file.path(out_base, rep_name)
+  dir.create(rep_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  msnset <- prepare_msnset(raw_data, info$abund_cols, markers_df, rep_name,
+                           rep_blocks = list(all = seq_len(14)))
+  plot_marker_profiles(msnset, rep_dir, rep_name)
+  svm_result <- run_svm_analysis(msnset, rep_dir, rep_name)
+  generate_tsne_outputs(svm_result$svmres_pred, rep_dir, rep_name)
+  
+  replicate_results[[rep_name]] <- list(msnset = msnset, svm_result = svm_result)
+  cat(rep_name, "COMPLETE\n")
+}
+
+
+###############################################################################
+## PART 3: OVERLAP ANALYSIS (average across replicates)
+###############################################################################
+
+cat("\n", strrep("=", 70), "\n")
+cat("OVERLAP ANALYSIS\n")
+cat(strrep("=", 70), "\n\n")
+
+overlap_dir <- file.path(out_base, "Overlap")
+dir.create(overlap_dir, showWarnings = FALSE, recursive = TRUE)
+
+all_ids       <- lapply(replicate_results, function(r) rownames(exprs(r$msnset)))
+core_proteins <- Reduce(intersect, all_ids)
+
+cat("Proteins per replicate:\n")
+for (nm in names(all_ids)) cat(" ", nm, ":", length(all_ids[[nm]]), "\n")
+cat("Core overlap (all 3):", length(core_proteins), "\n\n")
+
+write_csv(tibble(Accession = sort(core_proteins)),
+          file.path(overlap_dir, "core_overlapping_proteins.csv"))
+
+expr_list <- lapply(replicate_results,
+                    function(r) exprs(r$msnset)[core_proteins, , drop = FALSE])
+avg_expr  <- Reduce("+", expr_list) / length(expr_list)
+
+first_fdata   <- fData(replicate_results[[1]]$msnset)
+overlap_fdata <- data.frame(
+  Accession   = core_proteins,
+  Description = first_fdata[core_proteins, "Description"],
+  markers     = "unknown",
+  stringsAsFactors = FALSE,
+  row.names   = core_proteins
+)
+m <- match(core_proteins, markers_df$ID)
+overlap_fdata$markers[!is.na(m)] <- markers_df$markers[m[!is.na(m)]]
+cat("Markers in overlap set:", sum(!is.na(m)), "\n")
+
+overlap_msnset <- MSnSet(
+  exprs = avg_expr,
+  fData = new("AnnotatedDataFrame", data = overlap_fdata),
+  pData = new("AnnotatedDataFrame", data = data.frame(
+    sampleNames = colnames(avg_expr),
+    Fraction    = seq_len(ncol(avg_expr)),
+    row.names   = colnames(avg_expr)
+  ))
+)
+
+plot_marker_profiles(overlap_msnset, overlap_dir, "Overlap")
+svm_overlap <- run_svm_analysis(overlap_msnset, overlap_dir, "Overlap")
+generate_tsne_outputs(svm_overlap$svmres_pred, overlap_dir, "Overlap")
+
+
+# ---- Consensus across replicates ----
+cat("\nBuilding SVM consensus...\n")
+
+consensus_df <- tibble(Accession = core_proteins)
+for (rep_name in names(replicate_results)) {
+  sfd <- fData(replicate_results[[rep_name]]$svm_result$svmres)
+  consensus_df[[paste0("SVM_", rep_name)]] <- sfd[core_proteins, "svm"]
+}
+
+consensus_df <- consensus_df %>%
+  rowwise() %>%
+  mutate(
+    consensus_pred  = { p <- c_across(starts_with("SVM_")); names(which.max(table(p))) },
+    consensus_count = { p <- c_across(starts_with("SVM_")); max(table(p)) }
+  ) %>%
+  ungroup() %>%
+  mutate(Description = first_fdata[core_proteins, "Description"]) %>%
+  left_join(markers_df %>% rename(Accession = ID, MarkerLabel = markers),
+            by = "Accession") %>%
+  mutate(MarkerLabel = replace_na(MarkerLabel, "unknown"))
+
+write_csv(consensus_df, file.path(overlap_dir, "SVM_consensus_predictions.csv"))
+
+cat("Consensus 3/3:", sum(consensus_df$consensus_count == 3), "\n")
+cat("Consensus 2/3:", sum(consensus_df$consensus_count == 2), "\n")
+cat("Consensus 1/3:", sum(consensus_df$consensus_count == 1), "\n")
+
+
+# ---- QSep spatial resolution ----
+cat("\nRunning QSep...\n")
+qsep_dir <- file.path(overlap_dir, "spatial_resolution")
+dir.create(qsep_dir, showWarnings = FALSE, recursive = TRUE)
+
+tryCatch({
+  qsep_res <- QSep(object = overlap_msnset, fcol = "markers")
+  
+  for (nm in c("boxplot", "boxplot_norm", "heatmap", "heatmap_norm")) {
+    norm <- grepl("norm", nm)
+    png(file.path(qsep_dir, paste0("QSep_", nm, ".png")),
+        width = 2000, height = if (grepl("heatmap", nm)) 2000 else 1500, res = 300)
+    if (grepl("heatmap", nm)) levelPlot(qsep_res, norm = norm)
+    else plot(qsep_res, norm = norm)
+    dev.off()
+  }
+  cat("QSep plots saved.\n")
+}, error = function(e) cat("QSep failed:", e$message, "\n"))
+
+
+###############################################################################
+## DONE
+###############################################################################
+cat("\n", strrep("=", 70), "\n")
+cat("ANALYSIS COMPLETE — outputs in:", out_base, "\n")
+cat(strrep("=", 70), "\n")
